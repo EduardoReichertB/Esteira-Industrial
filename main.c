@@ -17,7 +17,23 @@
 #include "driver/gpio.h"
 #include "driver/touch_sens.h"
 
+//novos includes:
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+
 #define TAG "ESTEIRA"
+
+// Mapeamento para usar wi-fi
+static const char *TAG_WIFI = "TCP_SERVER";
+#define WIFI_SSID "nome_internet"
+#define WIFI_PASS "senha_internet"
+#define TCP_PORT 7000 // qualquer número entre 0 e 65535
+
+#define PC_IP   "ip_pc"   // IP do PC - use ifconfig (Linux) ou ipconfig (Windows) para achar o IP
+#define PC_PORT 7070 // qualquer número entre 0 e 65535
 
 // ====== Mapeamento dos touch pads ======
 #define TP_OBJ   TOUCH_PAD_NUM7   // Touch B -> detecção de objeto (desvio)
@@ -30,13 +46,42 @@
 #define PRIO_ENC        4 // RM: 5 DM: 4 CS: 4
 #define PRIO_CTRL       3 // RM: 4 DM: 3 CS: 3
 #define PRIO_SORT       2 // RM: 3 DM: 2 CS: 3
+#define PRIO_MON        1 // prioridade monitor
 #define STK             3072
 
 // ====== Deadlines (do enunciado) ======
-#define DEADLINE_ENC_US      5500    // 5 ms
-#define DEADLINE_CTRL_US    10000    // 10 ms
-#define DEADLINE_SORT_US    10000    // 10 ms
-#define DEADLINE_SAFETY_US   5000    // 5 ms
+#define DEADLINE_ENC_US       5000    // 5 ms
+#define DEADLINE_CTRL_US     10000    // 10 ms
+#define DEADLINE_SORT_US     10000    // 10 ms
+#define DEADLINE_SAFETY_US    5000    // 5 ms
+#define DEADLINE_MONITOR_US 500000    // 500 ms
+#define MONITOR_PERIOD_MS      500
+
+// comandos dentro do monitor
+typedef enum {
+  CMD_SORT,
+  CMD_ESTOP,
+  CMD_STATUS,
+  CMD_PING
+}monitor_cmd_t;
+
+// tipo para mensagem do monitor
+typedef struct {
+  char payload[256];
+}monitor_msg_t;
+
+// PARA MONITOR
+static QueueHandle_t qMonitorTx = NULL;  //fila para mandar os log
+static QueueHandle_t qMonitorCmd = NULL; //fila de comando
+
+static TaskHandle_t hMonitor = NULL;
+static TaskHandle_t hNet = NULL;
+
+// Estatísticas temporais da MONITOR_TASK
+static uint32_t monitor_total = 0;
+static uint32_t monitor_misses = 0;
+static int64_t monitor_c_max_us = 0;
+static int64_t monitor_r_max_us = 0;
 
 // ====== Handles/IPC ======
 static TaskHandle_t hENC = NULL, hCTRL = NULL, hSORT = NULL, hSAFE = NULL;
@@ -80,6 +125,329 @@ static belt_state_t g_belt = { .rpm = 0.f, .pos_mm = 0.f, .set_rpm = 120.0f };
 static volatile int64_t tempo_touch_b = 0;
 static volatile int64_t tempo_touch_c = 0;
 static volatile int64_t tempo_touch_d = 0;
+
+static void monitor_process_command(monitor_cmd_t cmd)
+{
+  switch (cmd) {
+  case CMD_SORT: {
+    sort_evt_t ev = {
+      .t_evt_us = esp_timer_get_time()
+    };
+
+    if (xQueueSend(qSort, &ev, 0) != pdTRUE) {
+      ESP_LOGW(TAG_WIFI, "MONITOR: fila SORT cheia");
+    }
+    break;
+  }
+  case CMD_ESTOP:
+    // Mesmo mecanismo de sinalização usado pela tarefa de segurança.
+    xSemaphoreGive(semEStop);
+    break;
+  case CMD_STATUS:
+    // O estado será enviado na próxima mensagem periódica.
+    break;
+  case CMD_PING:
+    // O tratamento da resposta PING/RTT fica na tarefa de rede.
+    break;
+  }
+}
+
+static void monitor_task(void *arg)
+{
+  TickType_t next = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(MONITOR_PERIOD_MS);
+
+  monitor_total = 0;
+  monitor_misses = 0;
+  monitor_c_max_us = 0;
+  monitor_r_max_us = 0;
+
+  for (;;) {
+    // Início da ativação: usado para medir resposta e execução.
+    const int64_t t_release = esp_timer_get_time();
+    const int64_t t_start = esp_timer_get_time();
+
+    // 1. Processa os comandos pendentes sem bloquear.
+    monitor_cmd_t cmd;
+
+    while (xQueueReceive(qMonitorCmd, &cmd, 0) == pdTRUE) {
+      monitor_process_command(cmd);
+    }
+
+    // 2. Coleta o estado e prepara a telemetria.
+    monitor_msg_t msg;
+
+    int n = snprintf(
+      msg.payload,
+      sizeof(msg.payload),
+      "{\"type\":\"telemetry\","
+      "\"ts_us\":%lld,"
+      "\"rpm\":%.2f,"
+      "\"pos_mm\":%.2f,"
+      "\"set_rpm\":%.2f,"
+      "\"enc_miss\":%d,"
+      "\"spd_miss\":%d,"
+      "\"sort_miss\":%d,"
+      "\"safety_miss\":%d}",
+      (long long)t_start,
+      (double)g_belt.rpm,
+      (double)g_belt.pos_mm,
+      (double)g_belt.set_rpm,
+      misses.misses_enc,
+      misses.misses_spd,
+      misses.misses_sort,
+      misses.misses_stop
+    );
+
+    // 3. Enfileira a mensagem sem esperar espaço na fila.
+    if (n > 0 && n < sizeof(msg.payload)) {
+      if (xQueueSend(qMonitorTx, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG_WIFI, "MONITOR: fila de telemetria cheia");
+      }
+    }
+
+    // 4. Mede C e verifica o deadline.
+    const int64_t t_end = esp_timer_get_time();
+    const int64_t C_us = t_end - t_start;
+    const int64_t R_us = t_end - t_release;
+
+    monitor_total++;
+
+    if (C_us > monitor_c_max_us) {
+      monitor_c_max_us = C_us;
+    }
+
+    if (R_us > monitor_r_max_us) {
+      monitor_r_max_us = R_us;
+    }
+
+    if (R_us > DEADLINE_MONITOR_US) {
+      monitor_misses++;
+      ESP_LOGW(TAG_WIFI, "MONITOR DEADLINE: R=%lld us, C=%lld us", (long long)R_us, (long long)C_us);
+    }
+
+    // 5. Espera até a próxima ativação periódica.
+    vTaskDelayUntil(&next, period);
+  }
+}
+
+static void udp_task(void *arg){
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+
+  if (sock < 0) {
+    ESP_LOGE(TAG_WIFI, "Falha ao criar socket UDP");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  struct sockaddr_in local = {0};
+  local.sin_family = AF_INET;
+  local.sin_port = htons(PC_PORT);
+  local.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if (bind(sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+    ESP_LOGE(TAG_WIFI, "Falha no bind UDP");
+    close(sock);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  struct timeval timeout = {
+    .tv_sec = 0,
+    .tv_usec = 20000
+  };
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+  struct sockaddr_in pc = {0};
+  pc.sin_family = AF_INET;
+  pc.sin_port = htons(PC_PORT);
+  inet_pton(AF_INET, PC_IP, &pc.sin_addr.s_addr);
+
+  char rx[256];
+
+  for (;;) {
+    // Envia a telemetria pendente sem bloquear esperando a fila.
+    monitor_msg_t msg;
+    if (xQueueReceive(qMonitorTx, &msg, 0) == pdTRUE) {
+      sendto(sock, msg.payload, strlen(msg.payload), 0, (struct sockaddr *)&pc, sizeof(pc));
+    }
+
+    // Recebe comandos. O timeout limita o tempo bloqueado.
+    struct sockaddr_in source;
+    socklen_t source_len = sizeof(source);
+
+    int len = recvfrom(sock, rx, sizeof(rx) - 1, 0, (struct sockaddr *)&source, &source_len);
+
+    if (len > 0) {
+      rx[len] = '\0';
+
+      monitor_cmd_t cmd;
+      bool valid = true;
+
+      if (strcmp(rx, "SORT") == 0) {
+        cmd = CMD_SORT;
+      }else if (strcmp(rx, "ESTOP") == 0) {
+        cmd = CMD_ESTOP;
+      }else if (strcmp(rx, "STATUS") == 0) {
+        cmd = CMD_STATUS;
+      }else if (strncmp(rx, "PING", 4) == 0) {
+        // PING é tratado separadamente para preservar o ID.
+        int64_t now = esp_timer_get_time();
+        char reply[128];
+        snprintf(reply, sizeof(reply), "{\"type\":\"PONG\",\"ts_us\":%lld,\"echo\":\"%.32s\"}", (long long)now, rx);
+
+        sendto(sock, reply, strlen(reply), 0, (struct sockaddr *)&source, source_len);
+        valid = false;
+      }else {
+        valid = false;
+        ESP_LOGW(TAG_WIFI, "Comando UDP desconhecido: %s", rx);
+      }
+
+      if (valid && xQueueSend(qMonitorCmd, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG_WIFI, "Fila de comandos cheia");
+      }
+    }
+  }
+}
+
+//Configura WiFi da ESP32
+static void wifi_init(void) {
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_sta();
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  wifi_config_t wifi_config = {
+    .sta = {
+      .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+    },
+  };
+  strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
+  strcpy((char*)wifi_config.sta.password, WIFI_PASS);
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  ESP_LOGI(TAG_WIFI, "Conectando ao WiFi...");
+  ESP_ERROR_CHECK(esp_wifi_connect());
+}
+
+static void tcp_task(void *arg){
+  int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+
+  if (listen_fd < 0) {
+    ESP_LOGE(TAG_WIFI, "Falha ao criar socket TCP");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  int reuse = 1;
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+  struct sockaddr_in addr = {0};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(TCP_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+    listen(listen_fd, 1) < 0) {
+    ESP_LOGE(TAG_WIFI, "Falha ao iniciar servidor TCP");
+    close(listen_fd);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  ESP_LOGI(TAG_WIFI, "Servidor TCP ativo na porta %d", TCP_PORT);
+
+  for (;;) {
+    struct sockaddr_in source;
+    socklen_t source_len = sizeof(source);
+    int client = accept(listen_fd, (struct sockaddr *)&source, &source_len);
+
+    if (client < 0) {
+      continue;
+    }
+
+    struct timeval timeout = {
+      .tv_sec = 0,
+      .tv_usec = 20000
+    };
+
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    ESP_LOGI(TAG_WIFI, "Cliente TCP conectado");
+
+    const char *hello = "{\"type\":\"connected\"}\n";
+    send(client, hello, strlen(hello), 0);
+    char rx[256];
+    for (;;) {
+      // Transmite mensagens pendentes.
+      monitor_msg_t msg;
+
+      if (xQueueReceive(qMonitorTx, &msg, 0) == pdTRUE) {
+        char line[300];
+
+        int n = snprintf(line, sizeof(line), "%s\n", msg.payload);
+        if (n <= 0 || n >= sizeof(line) || send(client, line, n, 0) < 0) {
+          break;
+        }
+      }
+
+      // Recebe comandos sem espera indefinida.
+      int len = recv(client, rx, sizeof(rx) - 1, 0);
+      if (len > 0) {
+        rx[len] = '\0';
+
+        // Este exemplo pressupõe um comando por recv().
+        // Para uso robusto, implemente enquadramento por '\n'
+        // e acumule dados recebidos em um buffer.
+        char *newline = strpbrk(rx, "\r\n");
+        if (newline != NULL) {
+          *newline = '\0';
+        }
+
+        monitor_cmd_t cmd;
+        bool valid = true;
+
+        if (strcmp(rx, "SORT") == 0) {
+          cmd = CMD_SORT;
+        }else if (strcmp(rx, "ESTOP") == 0) {
+          cmd = CMD_ESTOP;
+        }else if (strcmp(rx, "STATUS") == 0) {
+          cmd = CMD_STATUS;
+        }else if (strncmp(rx, "PING", 4) == 0) {
+          char reply[128];
+
+          snprintf(reply, sizeof(reply), "{\"type\":\"PONG\",\"echo\":\"%.32s\"}\n", rx);
+
+          if (send(client, reply, strlen(reply), 0) < 0) {
+            break;
+          }
+
+          valid = false;
+        }else {
+          valid = false;
+          ESP_LOGW(TAG_WIFI, "Comando TCP desconhecido: %s", rx);
+        }
+
+        if (valid && xQueueSend(qMonitorCmd, &cmd, 0) != pdTRUE) {
+          ESP_LOGW(TAG_WIFI, "Fila de comandos cheia");
+        }
+      }else if (len == 0) {
+        // O PC encerrou a conexão.
+        break;
+      }else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        // Erro real de recepção.
+        break;
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    shutdown(client, SHUT_RDWR);
+    close(client);
+    ESP_LOGI(TAG_WIFI, "Cliente TCP desconectado");
+  }
+}
 
 // ====== Util: busy loop previsível (~WCET) ======
 static inline void cpu_tight_loop_us(uint32_t us)
@@ -279,6 +647,17 @@ static bool IRAM_ATTR touch_inactive_cb(touch_sensor_handle_t h, const touch_ina
 // ====== app_main ======
 void app_main(void)
 {
+  ESP_ERROR_CHECK(nvs_flash_init());
+  wifi_init();
+
+  // Filas da MONITOR_TASK e da tarefa de rede
+  qMonitorTx = xQueueCreate(10, sizeof(monitor_msg_t));
+  qMonitorCmd = xQueueCreate(10, sizeof(monitor_cmd_t));
+
+  if (qMonitorTx == NULL || qMonitorCmd == NULL) {
+    ESP_LOGE(TAG, "Falha ao criar filas do monitoramento");
+    abort();
+  }
 
   // criar os mutex e a fila
   semEStop = xSemaphoreCreateBinary();
@@ -326,6 +705,34 @@ void app_main(void)
   xTaskCreatePinnedToCore(task_enc_sense,"ENC_SENSE",STK, NULL, PRIO_ENC,   &hENC,  0);
   xTaskCreatePinnedToCore(task_spd_ctrl, "SPD_CTRL", STK, NULL, PRIO_CTRL,  &hCTRL, 0);
   xTaskCreatePinnedToCore(task_sort_act, "SORT_ACT", STK, NULL, PRIO_SORT,  &hSORT, 0);
+
+  //novas tasks:
+  // Criar MONITOR_TASK periódica
+  BaseType_t ok = xTaskCreate(
+    monitor_task,
+    "MONITOR_TASK",
+    4096,
+    NULL,
+    PRIO_MON,
+    &hMonitor
+  );
+
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG, "Falha ao criar MONITOR_TASK");
+    abort();
+  }
+
+  // Criar a tarefa de comunicação escolhida
+  #if MONITOR_USE_TCP
+    ok = xTaskCreate(tcp_task, "NET_TCP", 4096, NULL, 2, &hNet);
+  #else
+    ok = xTaskCreate(udp_task, "NET_UDP", 4096, NULL, 2, &hNet);
+  #endif
+
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG, "Falha ao criar tarefa de rede");
+    abort();
+  }
 
   hCtrlNotify = hCTRL;
 }
