@@ -23,16 +23,40 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "esp_event.h"
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
+#include <inttypes.h>
 
 #define TAG "ESTEIRA"
 
+//VARIAVEIS PARA A TASK TIME
+static const char *TAG_TIME = "TIME_TASK";
+
+#define TIME_PERIOD_MS       1000
+#define TIME_DEADLINE_US     1000000
+#define TIME_STACK           3072
+#define TIME_PRIORITY        1
+
+static portMUX_TYPE time_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static int64_t last_sntp_sync_us = -1;
+static uint32_t sntp_sync_generation = 0;
+
+static uint32_t time_total = 0;
+static uint32_t time_deadline_misses = 0;
+static int64_t time_c_max_us = 0;
+
+#define MONITOR_PROTOCOL_NAME "UDP"
+
 // Mapeamento para usar wi-fi
 static const char *TAG_WIFI = "TCP_SERVER";
-#define WIFI_SSID "nome_internet"
-#define WIFI_PASS "senha_internet"
+#define WIFI_SSID "FAAR_2G"
+#define WIFI_PASS "paoCOMmanteiga"
 #define TCP_PORT 7000 // qualquer número entre 0 e 65535
 
-#define PC_IP   "ip_pc"   // IP do PC - use ifconfig (Linux) ou ipconfig (Windows) para achar o IP
+#define PC_IP   "192.168.1.109"   // IP do PC - use ifconfig (Linux) ou ipconfig (Windows) para achar o IP
 #define PC_PORT 7070 // qualquer número entre 0 e 65535
 
 // ====== Mapeamento dos touch pads ======
@@ -126,6 +150,130 @@ static volatile int64_t tempo_touch_b = 0;
 static volatile int64_t tempo_touch_c = 0;
 static volatile int64_t tempo_touch_d = 0;
 
+//registra um instante
+static void time_sync_notification_cb(struct timeval *tv)
+{
+  (void)tv;
+
+  int64_t now_us = esp_timer_get_time();
+
+  portENTER_CRITICAL(&time_mux);
+  last_sntp_sync_us = now_us;
+  sntp_sync_generation++;
+  portEXIT_CRITICAL(&time_mux);
+
+  ESP_LOGI(TAG_TIME, "Tempo sincronizado via SNTP");
+}
+
+static void time_sntp_init(void){
+    // Fuso horário de Brasília: UTC-3
+    setenv("TZ", "BRT-3", 1);
+    tzset();
+
+    // Callback chamado quando o relógio é sincronizado
+    esp_sntp_set_time_sync_notification_cb(
+      time_sync_notification_cb
+    );
+
+    // Servidores NTP
+    esp_sntp_setservername(0, "a.st1.ntp.br");
+    esp_sntp_setservername(1, "b.st1.ntp.br");
+    esp_sntp_setservername(2, "pool.ntp.org");
+
+    // Configura e inicia o SNTP
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_init();
+
+    ESP_LOGI(TAG_TIME, "SNTP iniciado; aguardando sincronizacao");
+}
+
+static void time_task(void *arg)
+{
+    (void)arg;
+
+    TickType_t next = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(TIME_PERIOD_MS);
+
+    uint32_t last_generation = 0;
+    uint32_t cycles_since_sync = 0;
+
+    for (;;) {
+        int64_t t_start = esp_timer_get_time();
+
+        // Captura hora atual do sistema.
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+
+        struct tm timeinfo = {0};
+        localtime_r(&tv.tv_sec, &timeinfo);
+
+        char timestamp[40];
+
+        strftime(timestamp, sizeof(timestamp),
+                 "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+        // Lê o estado da última sincronização SNTP.
+        int64_t sync_us;
+        uint32_t generation;
+
+        portENTER_CRITICAL(&time_mux);
+        sync_us = last_sntp_sync_us;
+        generation = sntp_sync_generation;
+        portEXIT_CRITICAL(&time_mux);
+
+        bool synced = (generation > 0);
+
+        if (generation != last_generation) {
+            last_generation = generation;
+            cycles_since_sync = 0;
+        } else if (synced) {
+            cycles_since_sync++;
+        }
+
+        // Milissegundos da hora civil.
+        int milliseconds = (int)(tv.tv_usec / 1000);
+
+        // Medição do tempo de execução C.
+        int64_t t_end = esp_timer_get_time();
+        int64_t C_us = t_end - t_start;
+
+        time_total++;
+
+        if (C_us > time_c_max_us) {
+            time_c_max_us = C_us;
+        }
+
+        if (C_us > TIME_DEADLINE_US) {
+            time_deadline_misses++;
+
+            ESP_LOGW(TAG_TIME,
+                     "Deadline excedido: C=%" PRId64 " us",
+                     C_us);
+        }
+
+        // Tempo monotônico desde a última sincronização.
+        int64_t sync_age_us = -1;
+
+        if (synced) {
+            sync_age_us = t_end - sync_us;
+        }
+
+        ESP_LOGI(TAG_TIME,
+                 "hora=%s.%03d synced=%s "
+                 "ciclos_desde_sync=%" PRIu32 " "
+                 "sync_age_ms=%" PRId64 " "
+                 "C_us=%" PRId64,
+                 timestamp,
+                 milliseconds,
+                 synced ? "sim" : "nao",
+                 cycles_since_sync,
+                 sync_age_us >= 0 ? sync_age_us / 1000 : -1,
+                 C_us);
+
+        vTaskDelayUntil(&next, period);
+    }
+}
+
 static void monitor_process_command(monitor_cmd_t cmd)
 {
   switch (cmd) {
@@ -177,11 +325,31 @@ static void monitor_task(void *arg)
     // 2. Coleta o estado e prepara a telemetria.
     monitor_msg_t msg;
 
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    struct tm timeinfo;
+    localtime_r(&tv.tv_sec, &timeinfo);
+
+    char timestamp[40];
+
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+
+    int milliseconds = (int)(tv.tv_usec / 1000);
+
+    int64_t unix_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    static uint32_t seq = 0;
+
     int n = snprintf(
       msg.payload,
       sizeof(msg.payload),
       "{\"type\":\"telemetry\","
-      "\"ts_us\":%lld,"
+      "\"seq\":%" PRIu32 ","
+      "\"protocol\":\"%s\","
+      "\"timestamp\":\"%s.%03d\","
+      "\"unix_ms\":%" PRId64 ","
+      "\"mono_us\":%" PRId64 ","
       "\"rpm\":%.2f,"
       "\"pos_mm\":%.2f,"
       "\"set_rpm\":%.2f,"
@@ -189,7 +357,12 @@ static void monitor_task(void *arg)
       "\"spd_miss\":%d,"
       "\"sort_miss\":%d,"
       "\"safety_miss\":%d}",
-      (long long)t_start,
+      seq++,
+      MONITOR_PROTOCOL_NAME,
+      timestamp,
+      milliseconds,
+      unix_ms,
+      t_start,
       (double)g_belt.rpm,
       (double)g_belt.pos_mm,
       (double)g_belt.set_rpm,
@@ -732,6 +905,21 @@ void app_main(void)
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "Falha ao criar tarefa de rede");
     abort();
+  }
+
+  time_sntp_init();
+
+  BaseType_t tempo = xTaskCreate(
+    time_task,
+    "TIME_TASK",
+    TIME_STACK,
+    NULL,
+    TIME_PRIORITY,
+    NULL
+  );
+
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG_TIME, "Falha ao criar TIME_TASK");
   }
 
   hCtrlNotify = hCTRL;
