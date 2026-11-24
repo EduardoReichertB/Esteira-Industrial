@@ -52,11 +52,11 @@ static int64_t time_c_max_us = 0;
 
 // Mapeamento para usar wi-fi
 static const char *TAG_WIFI = "TCP_SERVER";
-#define WIFI_SSID "FAAR_2G"
-#define WIFI_PASS "paoCOMmanteiga"
+#define WIFI_SSID "nome do wifi"
+#define WIFI_PASS "senha"
 #define TCP_PORT 7000 // qualquer número entre 0 e 65535
 
-#define PC_IP   "192.168.1.109"   // IP do PC - use ifconfig (Linux) ou ipconfig (Windows) para achar o IP
+#define PC_IP   " "   // IP do PC - use ifconfig (Linux) ou ipconfig (Windows) para achar o IP
 #define PC_PORT 7070 // qualquer número entre 0 e 65535
 
 // ====== Mapeamento dos touch pads ======
